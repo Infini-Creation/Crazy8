@@ -1,0 +1,1168 @@
+#!/usr/bin/perl
+
+# Crazy 8's
+
+# This little game is released under the Perl Artistic license (see http://dev.perl.org/licenses/artistic.html)
+# It is based on Crazy 8's written by Curt Esser on Amiga in Blitz basic.
+# Sources are available on Aminet, under dev/blitz and game somewhere else.
+#
+# Thanks to Curt for this great game, and also to lot's of people making Perl and modules
+# and thanks to Amir Karger <amirkargerweb@mail.yahoo.com> for Games::Cards::* modules and
+# to aldhar H. Vyas <jaldhar@debian.org> for making debian package of them.
+
+# 	01/01/2007
+# 
+
+# issues:
+#
+#	- end of match: not when only 1 players is over max score ! (he/she is eliminated BUT others continue
+#		to play !) => NOT SURE: winner is the 1st with no card, others loose !
+#		depend of score kind: lowest: ok, highest... not sure, see games rules
+#
+#	-undo => lost players hand after 1st card played
+#		is it really usefull ?? (multiplayer consideration !)
+#	-in some cases (rare) AI choose wrong suit, and goes into infinite loop !
+#	-not really a bug: don't take card will be played in suit count (eq: choose suit D when only AI card 
+#	of suit D is 8 just played !)
+#	- if num-players > players, fill players list with computer players
+#	- last player card = 8 => don't ask suit
+
+use strict;
+use File::Basename qw(basename);
+use Getopt::Long;
+
+my $log4perl_not_available = 0;
+
+BEGIN
+{
+	eval
+	{
+		require Log::Log4perl;
+		import Log::Log4perl qw(:levels :nowarn);
+	};
+	if ($@)
+	{
+		print STDERR "ERROR: $@\n";
+		$log4perl_not_available = 1;
+	}
+}
+
+use Games::Cards;
+use Games::Cards::Undo;
+
+use Games::Player;
+
+my $VERSION = '0.01';
+my $RELEASE = '2008/02/25';
+
+
+use constant MAXIMUM_RECURSIVE_CALL => 4;
+
+use constant SCORE_KIND_HIGHEST => 1;
+use constant SCORE_KIND_LOWEST => 2;
+use constant DEFAULT_PLAYERS => 2;
+use constant MAX_PLAYERS => 6;
+use constant DEFAULT_FIRST_PLAYER => 0;
+use constant MIN_SCORE => 50;
+use constant MAX_SCORE => 500;
+use constant COMPUTER_MIN_LEVEL => 0;
+use constant COMPUTER_MAX_LEVEL => 9;
+use constant DEFAULT_COMPUTER_LEVEL => 5;
+use constant MIN_SPEED => 0;
+use constant MAX_SPEED => 9;
+use constant DEFAULT_GAME_SPEED => 1;
+use constant DEFAULT_SORT_OPTION => 0;
+
+my $l4p_init =
+	{
+		'log4perl.category.Game' => 'DEBUG, File',
+		'log4perl.appender.File.Threshold' => 'DEBUG',
+		'log4perl.appender.File' => 'Log::Log4perl::Appender::File',
+		'log4perl.appender.File.layout' => 'Log::Log4perl::Layout::PatternLayout',
+		'log4perl.appender.File.layout.ConversionPattern' => '%d %p> %F{1}:%L %M - %m%n',
+		'log4perl.appender.File.mode' => 'append',
+		'log4perl.appender.File.filename' => 'crazy8s-'.&_today.'-'.&_time.'.log',
+	};
+
+
+my $card_values =
+	{
+		'Ace' => 20,
+		2 => 2,
+		3 => 3,
+		4 => 4,
+		5 => 5,
+		6 => 6,
+		7 => 7,
+		8 => 50,
+		9 => 9,
+		10 => 10,
+		'Jack' => 10,
+		'Queen' => 10,
+		'King' => 10,
+	};
+
+
+my $CONFIG =
+	{
+		number_of_players => 2,
+		players => 'C|computer,H|human',
+		auto_suffle => 0,
+		auto_sort => 0,
+		auto_take_card => 0,
+		auto_save_players => 1,
+		first_player => 0,
+		max_score => 200,
+		score_kind => SCORE_KIND_LOWEST,
+		max_undo => 50,
+		computer_opponents_level => 0,
+		game_speed => 2,	#1->9
+		sound => 0,
+		no_log => 0,
+		logfile => '',
+	};
+
+
+my $help_requested;
+my $version_requested;
+
+my $getopt_ok = GetOptions
+				(
+					"number-of-players|n=i" => \$CONFIG->{number_of_players},
+					"players=s" => \$CONFIG->{players},
+					"auto-shuffle|as" => \$CONFIG->{auto_suffle},
+					"auto-sort|at" => \$CONFIG->{auto_sort},
+					"auto-take-card|atc" => \$CONFIG->{auto_take_card},
+					"auto-save-players" => \$CONFIG->{auto_save_players},
+					"first-player|fp=i" => \$CONFIG->{first_player},
+					"score-max|max=i" => \$CONFIG->{max_score},
+					"score-kind|sk" => \$CONFIG->{score_kind},
+					"computer-level|level|l=s" => \$CONFIG->{computer_opponents_level},
+					"game-speed|speed" => \$CONFIG->{game_speed},
+					"sound!" => \$CONFIG->{sound},
+					"nolog" => \$CONFIG->{no_log},
+					"log=s" => \$CONFIG->{logfile},
+					"help|h" => \$help_requested,
+					"version|v" => \$version_requested,
+				);
+
+if ($help_requested or $version_requested)
+{
+	&usage;
+	exit 0;
+}
+
+print "Initialize game...\n";
+
+my $Game = Games::Cards::Game->new ({'cards_in_suit' => $card_values});
+my $Deck;
+my $discard;
+my $store;
+
+my $undo_buffer = new Games::Cards::Undo ($CONFIG->{max_undo});
+
+my $_logger;
+
+my $top_card;
+my $current_player = 1;
+my $input;
+
+&_init_logfile;
+
+my $players = init_players ();
+
+_log('Run game');
+
+while (&high_score < $CONFIG->{max_score})
+{
+	&initialize_match;
+
+	while (1)
+	{
+		display_game ();
+
+		$current_player = 1 if ($current_player > $CONFIG->{number_of_players});
+
+		if ($players->[$current_player - 1]->is_human ())
+		{
+			print "\n($current_player) Play: ";
+			$input = <STDIN>;
+			chomp $input;
+		}
+		else
+		{
+			my @card_part = split //, $top_card;
+			my $top_suit = $card_part[$#card_part - 1];
+			my $moves = player_can_play ($players->[$current_player - 1]->hand (), $discard->top_card (), $top_suit);
+			while ($#{$moves} < 0)
+			{
+				&take_a_card;
+				$moves = player_can_play ($players->[$current_player - 1]->hand (), $discard->top_card ()), $top_suit;
+				sleep (1);
+			}
+
+			$input = _highest_card ($players->[$current_player - 1]->hand (), $top_suit );
+			unless (defined $input)
+			{
+				my $choosen_card = int (rand ($#{$moves} + 1));
+				$input = $moves->[$choosen_card];
+			}
+
+			_log ($DEBUG, "AI: choosen card: $input");
+		}
+
+		if (process_user_command ($input) == 1)
+		{
+			sleep 1 if ($players->[$current_player - 1]->is_not_human ());
+			unless (&check_for_winner)
+			{
+				$current_player++;
+			}
+			else
+			{
+				print "Player [$current_player] wins !\n";
+				_log ($INFO, "Player [$current_player] wins !");
+
+				for my $count (1 .. $CONFIG->{number_of_players})
+				{
+					if (($CONFIG->{score_kind} == SCORE_KIND_LOWEST and $count == $current_player)  or
+						($CONFIG->{score_kind} == SCORE_KIND_HIGHEST and $count != $current_player))
+					{
+						$players->[$count - 1]->win ();
+						next;
+					}
+
+					$players->[$count - 1]->score (calc_score ($players->[$count - 1]->hand ()));
+					$players->[$count - 1]->loose ();
+
+					print 'Score ['.$count.']: '.$players->[$count - 1]->score ()."\n";
+					_log ($INFO, 'Score ['.$count.']: '.$players->[$count - 1]->score ());
+				}
+
+				last;
+			}
+		}
+	}
+}
+
+print "Save players\n";
+if ($CONFIG->{auto_save_players})
+{
+	for my $count (0 .. $CONFIG->{number_of_players} - 1)
+	{
+		$players->[$count]->save ();
+	}
+}
+
+
+sub initialize_match
+{
+	print "Initialize match...\n";
+	_log ($INFO, '-' x 80);
+	_log ($INFO, 'Initialize match...');
+
+	undef $Deck;
+	undef $store;
+	undef $discard;
+
+	$Deck = Games::Cards::Deck-> new ($Game, 'deck');
+	$store = Games::Cards::Queue-> new ($Game, 'store');
+	$discard = Games::Cards::Stack-> new ($Game, 'discard');
+
+	$Deck->shuffle;
+
+	for my $count (0 .. $CONFIG->{number_of_players} - 1)
+	{
+		$players->[$count]->hand (Games::Cards::Hand->new ($Game, 'player'.($count+1)));
+		
+		$Deck->give_cards ($players->[$count]->hand (), 5);
+	}
+
+	$Deck->give_cards ($store, 'all');
+
+	$store->give_cards ($discard, 1);
+	$top_card = $discard->top_card ()->print ();
+
+	$undo_buffer->end_move ();
+}
+
+
+sub calc_score
+{
+	my $hand = shift;
+	my $score = 0;
+
+	if (defined $hand and $hand->isa ('Games::Cards::Hand'))
+	{
+		my $cards_in_hand = $hand->cards;
+		for my $card (@{$cards_in_hand})
+		{
+			$score += $card->value if (defined $card and $card->isa ('Games::Cards::Card'));
+		}
+	}
+
+	$score;
+}
+
+
+sub high_score
+{
+	my $high_score = 0;
+
+	for my $count (0 .. $CONFIG->{number_of_players} - 1)
+	{
+		if (defined $players->[$count] and $players->[$count]->isa ('Games::Player'))
+		{
+			$high_score = $players->[$count]->score () if ($players->[$count]->score () > $high_score);
+		}
+	}
+
+	$high_score;
+}
+
+
+sub display_game
+{
+	print "\tScore :\t";
+	for my $count (0 .. $CONFIG->{number_of_players} - 1)
+	{
+		print ''.$players->[$count]->name ().': '.$players->[$count]->score ().'  ';
+	}
+
+	print "\n\n\tD:[$top_card]\t Ss: [".$store->size."]\n\n";
+
+	for my $count (0 .. $CONFIG->{number_of_players} - 1)
+	{
+		$players->[$count]->hand ()->face_down () if ($players->[$count]->is_not_human ());
+
+		my $array_of_cards = $players->[$count]->hand()->cards;
+		my $card_count = 0;
+		my $string_to_print = join ' ', map {$card_count++; "$card_count:".$_->print ('short')} @{$array_of_cards};
+
+		print 'P'.($count + 1).' ('.$players->[$count]->hand ()->size ()."): $string_to_print\n\n";
+	}
+
+	print "\n";
+}
+
+
+sub process_user_command
+{
+	my $input = shift;
+	my $end_turn = 0;
+
+	if (defined $input)
+	{
+		$input =~ s/^\s+//;
+		$input =~ s/\s+$//;
+
+		if ($input =~ /^(?:h|\?|help)$/i)
+		{
+			&help;
+		}
+		elsif ($input =~ /^(?:k|skip)$/i)
+		{
+			$end_turn = 1 if (&skip_turn);
+		}
+		elsif ($input =~ /^load$/i)
+		{
+			#load games/players
+		}
+		elsif ($input =~ /^(?:q|quit|bye)$/i)
+		{
+			&quit;
+		}
+		elsif ($input =~ /^(?:r|redo)$/i)
+		{
+			&redo;
+		}
+		elsif ($input =~ /^save$/i)
+		{
+			#save game/players
+		}
+		elsif ($input =~ /^(?:s|sort)\s*(.*)$/i)
+		{
+			sort_my_hand ($1); # opt: suit/value/suit & value
+			$undo_buffer->end_move ();
+		}
+		elsif ($input =~ /^(?:t|take)$/i)
+		{
+			&take_a_card;
+			$undo_buffer->end_move ();
+		}
+		elsif ($input =~ /^(?:u|undo)$/i)
+		{
+			&undo;
+		}
+		elsif (length $input > 0 and ($input =~ /^\d{1,2}$/ or $input =~ /^(\d{1,2}|A|J|Q|K)(C|D|H|S)$/i))
+		{
+			if (play_card ($input) == 1)
+			{
+				$undo_buffer->end_move ();
+				$end_turn = 1;
+			}
+		}
+		else
+		{
+			print "Unknow command !\n";
+		}
+	}
+
+	$end_turn;
+}
+
+
+sub help
+{
+	print "Crazy 8's help:\n";
+	print "Sort 1: suit 2:value other: suit and value\n";
+
+	# to complete
+}
+
+
+sub quit
+{
+	print "Are you sure you want to quit ? (y/n): ";
+	my $answer = <STDIN>;
+	if ($answer =~ /y/i)
+	{
+		# Update players rank/saves
+		print "Bye\n";
+		_log ($INFO, 'quit game');
+		exit 1;
+	}
+}
+
+
+sub play_card
+{
+	my $card_index = shift;
+	my $card_name;
+
+	_log ($DEBUG, 'play_card called');
+
+	if (defined $card_index and $card_index !~ /^\d{1,2}$/)
+	{
+		$card_name = $card_index;
+		$card_index = $players->[$current_player - 1]->hand ()->index ($card_name);
+		_log ("Get I:$card_index => N:$card_name\n");
+	}
+	else
+	{
+		$card_index--;
+
+		$card_name =  $players->[$current_player - 1]->hand ()->name ($card_name);
+		_log ("Get I:$card_index => N:$card_name\n");
+	}
+
+	if ($card_index < 0 or $card_index > $players->[$current_player - 1]->hand ()->size () - 1)
+	{
+		_log ("Wrong card played: CI=$card_index/HS=".$players->[$current_player - 1]->hand ()->size ());
+		print "Wrong card !\n";
+		return 0;
+	}
+	else
+	{
+		my $player_cards = $players->[$current_player - 1]->hand ()->cards ();
+		unless (is_legal ($player_cards->[$card_index], $discard->top_card ()))
+		{
+			print "Wrong card played!\n";
+			if ($CONFIG->{auto_take_card})
+			{
+				#print "You must take a card from stock !\n";
+				&take_a_card;
+			}
+			return 0;
+		}
+		else
+		{
+			my $new_suit = 0;
+
+			_log ("play card #$card_index\n");
+			$player_cards->[$card_index]->face_up ();
+			print "Play: [$card_index] ".$player_cards->[$card_index]->print ()."\n";
+
+			if ($player_cards->[$card_index]->name () eq '8')
+			{
+				_log ('Play an 8');
+				while ($new_suit !~ /C|D|H|S/i)
+				{
+					if ($players->[$current_player - 1]->is_human ())
+					{
+						print "New suit ?";
+						$new_suit = <STDIN>;
+						chomp $new_suit;
+						$new_suit = uc $new_suit;
+						_log ("Human player choose: $new_suit");
+					}
+					else
+					{
+						$new_suit = _choose_a_suit ($players->[$current_player - 1]->hand (), $player_cards->[$card_index]);
+
+						_log ("Computer player choose: $new_suit");
+					}
+				}
+				_log ("Suit choosen: $new_suit\n");
+			}
+
+			$players->[$current_player - 1]->hand ()->give_a_card ($discard, $card_index);
+
+			$top_card = $discard->top_card ()->print ();
+			$top_card =~ s/(C|D|H|S)/$new_suit/i if ($new_suit);
+			_log ("Top card: $top_card");
+		}
+	}
+
+	1;
+}
+
+
+sub rebuild_stock
+{
+	print "rebuild stock pile\n";
+	_log ("rebuild stock pile");
+
+	if ($store->size == 0)
+	{
+		if ($discard->size > 0)
+		{
+			# keep top card of discard pile
+			my $display = Games::Cards::Stack->new ($Game, 'temp');
+			$discard->give_cards ($display, 1);
+
+			_log ("Display: ".$display->top_card ()->print ('short')."\n");
+
+			_log ("D:dc_sz: ".$discard->size ()."    st_sz:".$store->size ()."\n");
+			$discard->give_cards ($store, 'all');
+			_log ("D:dc_sz: ".$discard->size ()."    st_sz:".$store->size ()."\n");
+
+			print "Shuffle store\n";
+			_log ("Shuffle store\n");
+			$store->shuffle;
+
+			_log ("D:dis_sz: ".$display->size ()."    dc_sz:".$discard->size ()."\n");
+			$display->give_cards ($discard, 'all');
+			_log ("D:dis_sz: ".$display->size ()."    dc_sz:".$discard->size ()."\n");
+		}
+		else
+		{
+			print "Discard pile is empty, skip your turn !\n";
+			# need something here
+		}
+	}
+	else
+	{
+		print "ERROR: store isn't empty !\n";
+		_log ($ERROR, "store isn't empty !");
+	}
+}
+
+
+sub is_legal
+{
+	my ($card, $real_top_card) = @_;
+
+	my $legal = 0;
+	my $top_name;
+	my $top_suit;
+
+	if (defined $card and $card->isa ('Games::Cards::Card') and
+		defined $real_top_card and $real_top_card->isa ('Games::Cards::Card'))
+	{
+		$top_suit = $real_top_card->suit ();
+		_log ("Rts: $top_suit");
+		_log ("Tcard: $top_card");
+
+		my @card_part = split //, $top_card;
+		_log ("CP: [".(join '/',@card_part)."]");
+		$top_suit = $card_part[$#card_part - 1];
+		_log ("\tFts: $top_suit");
+		if ($top_suit ne $real_top_card->suit ())
+		{
+			_log ("use fake suit: $top_suit");
+		}
+
+		_log ('N:'.$card->name ().'  S:'.$card->suit ());
+		_log ("TCn: ".$real_top_card->name ()."\tTCs: $top_suit");
+
+		if ($card->name () eq '8' or
+			$real_top_card->name () eq $card->name () or
+			$top_suit eq $card->suit ())
+		{
+			$legal = 1;
+		}
+	}
+	else
+	{
+		print "Error: invalid card object !\n";
+	}
+
+	$legal;	
+}
+
+
+sub take_a_card
+{
+	my $recursive_count = shift;
+
+	if (defined $store and $store->isa ('Games::Cards::Queue') and 
+		defined $players and ref $players eq 'ARRAY' and
+		defined $players->[$current_player - 1] and $players->[$current_player - 1]->isa ('Games::Player') and
+		$players->[$current_player - 1]->hand ()->isa ('Games::Cards::Hand') )
+	{
+		unless ($store->give_cards ($players->[$current_player - 1]->hand (), 1) == 1)
+		{
+			&rebuild_stock;
+
+			$recursive_count = defined $recursive_count ? $recursive_count++ : 1;
+			if ($recursive_count > MAXIMUM_RECURSIVE_CALL)
+			{
+				_log ($DEBUG, "RC: $recursive_count > ".MAXIMUM_RECURSIVE_CALL);
+				_log ($ERROR, "maximum recursive call reach, break loop !");
+			}
+			else
+			{
+				_log ($DEBUG, "Call again take_a_card ($recursive_count)");
+				take_a_card ($recursive_count);
+			}
+		}
+
+		my $cards = $players->[$current_player - 1]->hand ()->cards ();
+
+		if (defined $cards and ref $cards eq 'ARRAY' and
+			defined $cards->[$#{$cards}] and
+			$cards->[$#{$cards}]->isa ('Games::Cards::Card') )
+		{
+			print '['.$current_player.'] Get a card';
+			if ($players->[$current_player - 1]->is_human ())
+			{
+				print ": ".$cards->[$#{$cards}]->print ();
+			}
+			print "\n";
+		}
+		else
+		{
+			print "Error: invalid player cards hand !\n";
+		}
+
+		if ($CONFIG->{auto_sort})
+		{
+			sort_my_hand ($CONFIG->{auto_sort});
+		}
+	}
+	else
+	{
+		print "Error: invalid queue store or player hand !\n";
+	}
+}
+
+
+sub sort_my_hand
+{
+	my $sort_option = shift;
+	_log ("Sort opt: $sort_option") if (defined $sort_option);
+
+	if (defined $players and ref $players eq 'ARRAY' and
+		defined $players->[$current_player - 1] and
+		$players->[$current_player - 1]->isa ('Games::Player') and
+		$players->[$current_player - 1]->hand ()->isa ('Games::Cards::Hand'))
+	{
+		$sort_option = 0 unless (defined $sort_option);
+
+		if ($sort_option == 1)
+		{
+			_log ('Hand sorted by suit');
+			$players->[$current_player - 1]->hand ()->sort_by_suit ();
+		}
+		elsif ($sort_option == 2)
+		{
+			_log ('Hand sorted by value');
+			$players->[$current_player - 1]->hand ()->sort_by_value ();
+		}
+		else
+		{
+			_log ('Hand sorted by suit and value');
+			$players->[$current_player - 1]->hand ()->sort_by_suit_and_value ();
+		}
+	}
+	else
+	{
+		print "ERROR: invalid players array/Hand\n";
+	}
+}
+
+
+sub skip_turn
+{
+	my $moves = player_can_play ($players->[$current_player - 1]->hand (), $discard->top_card ());
+	unless ($#{$moves} > -1)
+	{
+		print "skip\n";
+		return 1;
+	}
+	else
+	{
+		print "You must play !\n";
+	}
+}
+
+
+sub check_for_winner
+{
+	return 1 if (defined $players and ref $players eq 'ARRAY' and
+				defined $players->[$current_player - 1] and
+				$players->[$current_player - 1]->isa ('Games::Player') and
+				$players->[$current_player - 1]->hand ()->isa ('Games::Cards::Hand') and
+				$players->[$current_player - 1]->hand ()->size () == 0);
+}
+
+
+sub undo
+{
+	print "Undo\n";
+	if ($undo_buffer->undo () )
+	{
+		#undo ok
+	}
+	else
+	{
+		print "Error on undo\n";
+	}
+}
+
+
+sub redo
+{
+	print "Redo\n";
+	if ($undo_buffer->redo () )
+	{
+		#redo ok
+	}
+	else
+	{
+		print "Error on redo\n";
+	}
+}
+
+
+#----------- Generic and usefull AI subs ---------------
+
+# player_can_play
+# IN: Games::Cards::Hand	Games::Cards::Card
+## OUT: bool
+# OUT: ref to an array of card faces
+sub player_can_play
+{
+	my ($player_hand, $real_top_card, $displayed_suit) = @_;
+	my $playable = [];
+
+	my $top_name;
+	my $top_suit;
+	my $available_moves = Games::Cards::Hand->new ($Game, 'a_moves');
+	my $clone_card;
+
+	if (defined $player_hand and $player_hand->isa ('Games::Cards::Hand') and
+		defined $real_top_card and $real_top_card->isa ('Games::Cards::Card'))
+	{
+		my @card_part = split //, $top_card;
+		_log ("tCP: [".(join '/',@card_part)."]");
+		$top_suit = $card_part[$#card_part - 1];
+		_log ("Fts: $top_suit");
+		if ($top_suit ne $real_top_card->suit ())
+		{
+			_log ("[Ts:$top_suit != RTCs:".$real_top_card->suit ()."] use fake suit");
+		}
+
+		_log ("TCn: ".$real_top_card->name ()."\tTCs: $top_suit");
+
+		for my $card (@{$player_hand->cards})
+		{
+			if ($card->name () eq '8' or
+				$real_top_card->name () eq $card->name () or
+				$top_suit eq $card->suit ())
+			{
+				_log ('['.$card->print ()."] Cs: ".$card->suit ()."\tCn: ".$card->name ()."  *");
+				$card->face_up ();
+				push @{$playable}, $card->print ();   #$card->name ().$card->suit ();
+				$card->face_down ();
+				$clone_card = $card->clone ($Game);
+				$clone_card->set_owning_cardset ($available_moves);
+				push @{$available_moves->cards}, $clone_card;	# little hack to add card to given cardset
+			}
+			else
+			{
+				_log ("Cs: ".$card->suit ()."\tCn: ".$card->name ());
+			}
+		}
+	}
+	else
+	{
+		_log ($ERROR, 'Invalid player hand/card given !');
+	}
+
+	_log ($INFO, "Playable cards: ".$#{$playable});
+	$playable;
+}
+
+
+# IN: player's hand
+# OUT: hash of suits which values are suits members count
+sub _get_suits_count
+{
+	my ($hand, $ignored_card) = @_;
+	my $count = 
+		{
+			'C' => 0,
+			'D' => 0,
+			'H' => 0,
+			'S' => 0,
+			max => ''
+		};
+
+	if (defined $hand and $hand->isa ('Games::Cards::Hand'))
+	{
+		for my $card (@{$hand->cards ()})
+		{
+			if (defined $ignored_card and $ignored_card->isa ('Games::Cards::Card'))
+			{
+				if ($ignored_card->name () eq $card->name () and
+					$ignored_card->suit () eq $card->suit ())
+				{
+					_log ('Ignore card :'.$ignored_card->print ().'in suit count');
+					next;
+				}
+			}
+			$count->{$card->suit ()}++;
+			$count->{max} = $card->suit () if ($count->{$card->suit ()} > $count->{max});
+			_log ('Cs: '.$card->suit ().'=> '.$count->{$card->suit ()});
+		}
+	}
+	else
+	{
+		_log ($ERROR, 'Invalid hand given!');
+	}
+
+	$count;
+}
+
+
+# IN : [suit]
+# OUT: highest value in this suit/for all suits in hand
+sub _highest_card
+{
+	my ($hand, $suit) = @_;
+
+	my $highest_value = 0;
+	my $highest;
+
+	if (defined $hand and $hand->isa ('Games::Cards::Hand') and
+		defined $suit and $suit =~ /^C|D|H|S$/i)
+	{
+		for my $card (@{$hand->cards ()})
+		{
+			if ($card->suit () =~ /$suit/i)
+			{
+				if ($highest_value < $card->value ())
+				{
+					$highest_value = $card->value ();
+					$card->face_up ();
+					$highest = $card->print ();
+					_log ('C: '.$card->print ()."=> $highest_value");
+					$card->face_down ();
+				}
+			}
+		}
+	}
+	else
+	{
+		print "Error: invalid hand/suit given!\n";
+	}
+
+	$highest;
+}
+
+
+# IN : [suit]
+# OUT: lowest value in this suit/for all suits in hand
+sub _lowest_card
+{
+	my ($hand, $suit) = @_;
+
+	my $lowest_value = 55;
+	my $lowest;
+
+	if (defined $hand and $hand->isa ('Games::Cards::Hand') and
+		defined $suit and $suit =~ /^C|D|H|S$/i)
+	{
+		for my $card (@{$hand->cards ()})
+		{
+			if ($card->suit () =~ /$suit/i)
+			{
+				if ($lowest_value > $card->value ())
+				{
+					$lowest_value = $card->value ();
+					$lowest = $card->print ();
+					_log ('C: '.$card->print ()."=> $lowest_value");
+				}
+			}
+		}
+	}
+	else
+	{
+		print "Error: invalid hand/suit given!\n";
+	}
+
+	$lowest;
+}
+
+
+sub _have_more_card_than_others
+{
+	my $computer = shift;
+	my $have_more_cards = 0;
+
+	_log ('_have_more_card_than_others called');
+
+	my $cards = $players->[$computer]->hand ()->size ();
+
+	for my $count (0 .. $CONFIG->{number_of_players} - 1)
+	{
+		next if ($count == $computer);
+		if ($cards > $players->[$count]->hand ()->size ())
+		{
+			$have_more_cards = 1;
+			last;
+		}
+	}
+
+	_log ("Result: $have_more_cards");
+	$have_more_cards;
+}
+
+
+sub _have_less_card_than_others
+{
+	my $computer = shift;
+	my $have_less_cards = 0;
+
+	_log ('_have_less_card_than_others called');
+
+	my $cards = $players->[$computer]->hand ()->size ();
+
+	for my $count (0 .. $CONFIG->{number_of_players} - 1)
+	{
+		next if ($count == $computer);
+		if ($cards < $players->[$count]->hand ()->size ())
+		{
+			$have_less_cards = 1;
+			last;
+		}
+	}
+
+	_log ("Result: $have_less_cards");
+	$have_less_cards;
+}
+
+
+sub _choose_a_suit
+{
+	my ($hand, $played_card) = @_;
+	my $suit;
+
+	if (defined $hand and $hand->isa ('Games::Cards::Hand'))
+	{
+		if ($hand->size () == 1)
+		{
+			_log ("Computer player have only one card in hand, suit is this card's suit");
+			$suit = @{$hand->cards ()}[0]->suit ();
+		}
+		else
+		{
+			my $suit_count = _get_suits_count ($hand, $played_card);
+			use Data::Dumper;	#tmp
+			_log ("suit count hash: ".Dumper ($suit_count));
+			# HERE: AI different behavior: max/min/high value/...
+			$suit = $suit_count->{max};
+			_log ("Computer player choose: $suit");
+		}
+	}
+	else
+	{
+		_log ($ERROR, "Hand is not defined or invalid");
+	}
+
+	$suit;
+}
+
+
+sub usage
+{
+	print "crazy'8s, Amiga game by Curt Esser resurrection\n January 2007\n";
+	print "Version: $VERSION released on $RELEASE\n";
+
+	unless ($version_requested)
+	{
+		print "\nAvailable options:\n";
+		print "\tnumber-of-players <n>\tset how many players in game\n";
+		print "\tplayers <specs>\t\tspecify players number and player type (format: K|Name, K=[C]omputer/[H]uman)\n";
+		print "\t\t\t\texample: for play with 2 computer players set 'C|cpu1, H|me, C|cpu2'\n";
+		print "\tauto-shuffle\t\t[Not supported yet]\n";
+		print "\tauto-sort <sort type>\tAutomatically sort your hand after playing a card:\n";
+			print "\t\t\t\ttype = 0 => suit and value, 1 => suit and 2 => value\n";
+		print "\tauto-take-card\t\tAutomatically take a card from stock if you can't play\n";
+		print "\tauto-save-players\t[Not supported yet]\n";
+		print "\tfirst-player\t\t<player index>\t\n";
+		print "\tscore-max <max>\t\tset maximum score of a game (max is for you or other players, depending of score-kind)\n";
+		print "\tscore-kind <type>\ttype = 1 => Highest 2 => lowest\n";
+		print "\tnolog\t\t\tdisable debugging log\n";
+		print"\tlog <logfile>\t\tspecify which logfile to use (debugging purpose only)\n";
+		print "\tcomputer-level\t\t[Not supported yet]\n";
+		print "\tgame-speed\t\t[Not supported yet]\n";
+		print "\tsound\t\t\t[Not supported yet] Enable/disable sounds\n";
+		print "\thelp\t\t\tthis help\n";
+		print "\tversion\t\t\tdisplay version and exit\n\n";
+	}
+}
+
+
+sub init_players
+{
+	my $players = [];
+
+	_log ($DEBUG, "Players list: ".$CONFIG->{players});
+	my @players_list = split /,/, $CONFIG->{players};
+
+	if ($#players_list != $CONFIG->{number_of_players} - 1)
+	{
+		_log ($WARN, "players list items count doesn't match defined number of players.");
+
+		$CONFIG->{number_of_players} = $#players_list + 1;
+		_log ($DEBUG, "number_of_players set to: ".$CONFIG->{number_of_players});
+	}
+
+	my $count = 0;
+	map
+	{
+		my ($type, $name) = split /\|/;
+		_log ($DEBUG, "Item: $_\tType: $type\tName:$name");
+		$players->[$count++] = Games::Player->new (name => $name, kind => $type);
+	} @players_list;
+
+	$players;
+}
+
+# ---- internal ----
+
+sub _validate_config
+{
+	if ($CONFIG->{number_of_players} < 0 or $CONFIG->{number_of_players} > MAX_PLAYERS)
+	{
+		$CONFIG->{number_of_players} = MAX_PLAYERS;
+	}
+	if ($CONFIG->{first_player}-- < 0 or $CONFIG->{first_player} > $CONFIG->{number_of_players} - 1)
+	{
+		$CONFIG->{first_player} = DEFAULT_FIRST_PLAYER;
+	}
+	if ($CONFIG->{max_score} < MIN_SCORE or $CONFIG->{max_score} > MAX_SCORE)
+	{
+		$CONFIG->{max_score} = MIN_SCORE;
+	}
+	if ($CONFIG->{score_kind} != SCORE_KIND_HIGHEST or $CONFIG->{score_kind} != SCORE_KIND_LOWEST)
+	{
+		$CONFIG->{score_kind} = SCORE_KIND_LOWEST;
+	}
+	if ($CONFIG->{computer_opponents_level} < COMPUTER_MIN_LEVEL or $CONFIG->{computer_opponents_level} > COMPUTER_MAX_LEVEL)
+	{
+		$CONFIG->{computer_opponents_level} = DEFAULT_COMPUTER_LEVEL;
+	}
+	if ($CONFIG->{game_speed} < MIN_SPEED or $CONFIG->{game_speed} > MAX_SPEED)
+	{
+		$CONFIG->{game_speed} = DEFAULT_GAME_SPEED;
+	}
+	if ($CONFIG->{auto_sort} < 0 or $CONFIG->{auto_sort} > 2)
+	{
+		$CONFIG->{auto_sort} = DEFAULT_SORT_OPTION;
+	}
+}
+
+
+sub _init_logfile
+{
+	return 0 if ($CONFIG->{no_log} or $log4perl_not_available);
+
+	eval
+	{
+		$Log::Log4perl::caller_depth++;
+		$_logger = Log::Log4perl::get_logger ("Game");
+
+		if (defined $CONFIG->{logfile} and length $CONFIG->{logfile} > 5 and -w basename ($CONFIG->{logfile}))
+		{
+			$l4p_init->{'log4perl.appender.File.filename'} = $CONFIG->{logfile};
+		}
+		else
+		{
+			print STDERR "Wrong setting for logile: [".$CONFIG->{logfile}."], use default\n";
+		}
+
+		Log::Log4perl::init($l4p_init);
+	};
+	if ($@)
+	{
+		print "ERROR $@\n" unless ($log4perl_not_available);
+	}
+}
+
+
+sub _close_logfile
+{
+	if (defined $_logger)
+	{
+		_log ('Remove logger');
+		undef $_logger;
+	}
+}
+
+
+sub _log
+{
+	my ($level, $message) = @_;
+
+    if (!defined $message and defined $level)
+    {
+        $message = $level;
+        $level = $DEBUG;
+    }
+
+    chomp $message;
+
+	if (defined $_logger and $_logger->isa ('Log::Log4perl::Logger'))
+	{
+		$_logger->log ($level, $message);
+	}
+}
+
+
+sub _today
+{
+    my @date = localtime;
+    my $month = $date[4]+1;
+    my $year = $date[5]+1900;
+
+    $year.sprintf ("%02d",$month).sprintf("%02d",$date[3]);
+}
+
+
+sub _time
+{
+    my $format = shift;
+
+    my @date = localtime;
+    sprintf (($format || "%02d%02d%02d"),$date[2], $date[1], $date[0]);
+}
+
+
+END
+{
+	&_close_logfile;
+}
